@@ -3,3 +3,6 @@ backup-*/
 
 # Built release binaries (attached to GitHub Releases, not tracked in git)
 hot-clone-linux-*
+
+# Local release tooling, not for the tracked repo
+release.ps1
