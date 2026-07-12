@@ -2,9 +2,11 @@
 
 All notable changes to hot-clone are documented here.
 
-## Unreleased
+## [1.0.1] - 2026-07-12
 
-- Add upcoming user-visible changes here before tagging a release.
+- Renamed executable.
+
+## Unreleased
 
 ## [1.0.0] - 2026-07-12
 
