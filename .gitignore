@@ -1,0 +1,5 @@
+# Local pre-change backups (see CLAUDE.md backup policy)
+backup-*/
+
+# Built release binaries (attached to GitHub Releases, not tracked in git)
+hot-clone-linux-*
