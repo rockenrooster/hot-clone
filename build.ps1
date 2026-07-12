@@ -6,7 +6,7 @@ $ErrorActionPreference = "Stop"
 
 Push-Location $PSScriptRoot
 try {
-    $out = Join-Path $PSScriptRoot "hot-clone-linux-amd64"
+    $out = Join-Path $PSScriptRoot "hot-clone"
 
     Write-Host "Building hot-clone for linux/amd64 -> $out"
     $env:GOOS = "linux"
