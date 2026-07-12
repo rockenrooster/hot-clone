@@ -1,95 +1,183 @@
-hot-clone
-===
+# hot-clone
 
-This tool allows you to image an actively changing block device. Including the one the rootfs is stored on.
+Create a block-level image of a **live Linux block device**, including the disk containing the running root filesystem.
 
-## Backup a device
+`hot-clone` reads the device while using Linux `blktrace` to track sectors changed during the copy. After the main pass finishes, it rereads those sectors and appends the corrected data to the backup.
 
-hot-clone uses blktrace, and needs root to enable it. Performance impact seems to be low, though if you are planning to image a highly loaded disk you will want to change the values of:
+> [!WARNING]
+> Imaging a mounted filesystem is not the same as creating an atomic snapshot. Prefer LVM, ZFS, Btrfs, DRBD, filesystem snapshots, or an offline image when available.
 
-```
-  -blktrace.bufcount int
-        The amount of buffers for blktrace to keep spare (default 16)
-  -blktrace.bufsize int
-        The size of each buffer for blktrace (default 65536)
-```
+## Features
 
-To something higher, Ideally not too high since it will add latency to disk change events.
+* Images mounted or actively changing block devices
+* Supports imaging the running root disk
+* Tracks writes that occur during the copy
+* Aborts if `blktrace` reports dropped events
+* Streams backup data through standard output
+* Supports files, SSH, pipes, and compression
+* Restores to a raw image file or block device
 
-```
-$ sudo ./hot-clone -device /dev/sdb > sdb.hc
-[sudo] password for ben: 
-2021/09/19 22:36:27 Read 18.0 MiB -- 0 Dirty sectors (0 event drops)
-...
-2021/09/19 22:39:48 Read 3.7 GiB -- 360 Dirty sectors (0 event drops)
-2021/09/19 22:39:49 Catching up 36/360 sectors
-2021/09/19 22:39:49 Catching up 72/360 sectors
-2021/09/19 22:39:49 Catching up 108/360 sectors
-2021/09/19 22:39:49 Catching up 144/360 sectors
-2021/09/19 22:39:49 Catching up 180/360 sectors
-2021/09/19 22:39:49 Catching up 216/360 sectors
-2021/09/19 22:39:49 Catching up 252/360 sectors
-2021/09/19 22:39:49 Catching up 288/360 sectors
-2021/09/19 22:39:49 Catching up 324/360 sectors
-2021/09/19 22:39:49 Catching up 360/360 sectors
-2021/09/19 22:39:49 Done
+## Requirements
+
+* Linux
+* Root access when creating an image
+* A kernel and device that support `blktrace`
+* Go 1.16 or newer when building from source
+
+## Build
+
+```bash
+git clone https://github.com/rockenrooster/hot-clone.git
+cd hot-clone
+go build -o hot-clone .
 ```
 
-The output it piped to stdout, this is so you can output to a file or a pipe (or directly invoke it from ssh)
+Verify the binary:
 
-## Restore a device
-
-You cannot directly restore the output of hot-clone, you will first need to reassemble it. To do this you select `-reassemble` for the hot-clone output, and `-reassemble-output` to the device or file you wish to restore to.
-
-```
-$ ./hot-clone -reassemble sdb.hc -reassemble-output sdb.img
-2021/09/19 22:40:14 Restoring section (Sector: 0 (len 3959422976 bytes)
-$ 
+```bash
+./hot-clone --help
 ```
 
-## Compile from source code
+## Create a backup
 
-Golang 1.13 or later is needed to compile. Debian 11 has a reccent enough version, compiling on older Debian will require manually installing golang.
+Identify the correct device:
 
-Compiling on Debian 11 and copying the executable to a box running an older OS seems to work (on 64bit PC hardware).
-
-To compile an executable binary:
-
-On the github page, click on code, click on "Download ZIP".
-
-
+```bash
+lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS,MODEL
 ```
-$ unzip -e hot-clone-main.zip
-$ cd hot-clone-main
-$ go build
 
+Create the backup:
+
+```bash
+sudo ./hot-clone -device /dev/sdb > sdb.hc
 ```
-See if your executable runs.
 
+Progress is written to standard error, while the backup stream is written to standard output.
+
+Example:
+
+```text
+Read 3.7 GiB -- 360 Dirty sectors (0 event drops)
+Catching up 360/360 sectors
+Done
 ```
-$ ./hot-clone --help
-  -blktrace.bufcount int
-        The amount of buffers for blktrace to keep spare (default 16)
-  -blktrace.bufsize int
-        The size of each buffer for blktrace (default 65536)
-  -device string
-        The device you wise to hot-clone
-  -print-writes
-        print all writes happening
-  -reassemble string
-        use this hot-clone backup file to restore into a file or block device
-  -reassemble-output string
-        The path of the file or block device that is going to be restored to
-  -verbose
-        be extra verbose on whats happening
 
+Do not save the backup onto the device being imaged.
+
+### Compress the backup
+
+```bash
+sudo ./hot-clone -device /dev/sdb |
+    zstd -T0 -10 -o sdb.hc.zst
 ```
-## Distributions
 
-Brief testing indicates that this works on Debian 8, 9, 10 and 11 and Ubuntu 18.10. 
+### Send it over SSH
 
-Debian 7 does not have the TRACE interface so hot-clone won't work.
+```bash
+sudo ./hot-clone -device /dev/sdb |
+    ssh backup@example-host 'cat > /srv/backups/sdb.hc'
+```
 
-## Notice
+## Restore or reassemble
 
-You should avoid using this tool if you can help it. LVM, MD Raid, and DRBD give you far better (and tested) methods to enable system snapshotting/real time backups.
+A `.hc` file is not a directly mountable raw disk image. Reassemble it first.
+
+### Restore to an image file
+
+```bash
+./hot-clone \
+    -reassemble sdb.hc \
+    -reassemble-output sdb.img
+```
+
+Inspect the resulting image:
+
+```bash
+fdisk -l sdb.img
+```
+
+### Restore to a block device
+
+> [!CAUTION]
+> This overwrites the destination device.
+
+```bash
+sudo ./hot-clone \
+    -reassemble sdb.hc \
+    -reassemble-output /dev/sdc
+```
+
+Confirm the destination with `lsblk` before running the command.
+
+## Common options
+
+```text
+-device string
+      Block device to image
+
+-reassemble string
+      Backup file to restore
+
+-reassemble-output string
+      Destination image file or block device
+
+-blktrace.bufcount int
+      Number of trace buffers
+
+-blktrace.bufsize int
+      Size of each trace buffer
+
+-print-writes
+      Log observed writes
+
+-verbose
+      Enable additional logging
+```
+
+## Heavy write workloads
+
+If the source device is receiving many writes, increase the trace buffers:
+
+```bash
+sudo ./hot-clone \
+    -device /dev/sdb \
+    -blktrace.bufcount 64 \
+    -blktrace.bufsize 262144 \
+    > sdb.hc
+```
+
+If trace events are dropped, the backup is aborted because it can no longer be considered safe. Delete the incomplete output and retry with less disk activity or larger buffers.
+
+## Limitations
+
+`hot-clone` does not create a true point-in-time snapshot.
+
+For better results:
+
+* Stop databases and write-heavy services
+* Run `sync` before starting
+* Minimize activity during imaging
+* Save the backup to another device or remote system
+* Reassemble and test the image after creation
+* Keep an independent backup made using another method
+
+## Changes in this fork
+
+This fork includes additional fixes for:
+
+* Lost or delayed write events
+* Dropped-event detection
+* Trace cleanup after errors or termination
+* Dirty-sector tracking races
+* Read and write error handling
+* Restore and catch-up performance
+
+See [CHANGELOG.md](CHANGELOG.md) for details.
+
+## Project history
+
+Based on the original [`benjojo/hot-clone`](https://github.com/benjojo/hot-clone) project.
+
+## License
+
+Licensed under the [MIT License](LICENSE).
