@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 package main
 
@@ -7,11 +7,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/signal"
-	"runtime"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,8 +21,30 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// resolveDeviceName resolves a device path to the canonical kernel name used
+// under /sys and /sys/kernel/debug (e.g. /dev/mapper/vg-lv -> dm-0,
+// /dev/disk/by-id/... -> sda), and reports whether the device is a
+// partition. Falls back to the path's basename if sysfs can't be consulted.
+func resolveDeviceName(dev string) (string, bool) {
+	fallback := filepath.Base(dev)
+	var st unix.Stat_t
+	if err := unix.Stat(dev, &st); err != nil {
+		return fallback, false
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFBLK {
+		log.Fatalf("%v is not a block device", dev)
+	}
+	sysPath := fmt.Sprintf("/sys/dev/block/%d:%d", unix.Major(st.Rdev), unix.Minor(st.Rdev))
+	target, err := os.Readlink(sysPath)
+	if err != nil {
+		return fallback, false
+	}
+	_, partErr := os.Stat(sysPath + "/partition")
+	return filepath.Base(target), partErr == nil
+}
+
 func getTotalDeviceSectorsSize(deviceBaseName string) uint64 {
-	b, err := ioutil.ReadFile(fmt.Sprintf("/sys/class/block/%s/size", deviceBaseName))
+	b, err := os.ReadFile(fmt.Sprintf("/sys/class/block/%s/size", deviceBaseName))
 	if err != nil {
 		log.Fatalf("Cannot read device block size %v", err)
 		return 0
@@ -39,7 +60,7 @@ func getTotalDeviceSectorsSize(deviceBaseName string) uint64 {
 }
 
 func getBlkTraceDrops(deviceBaseName string) uint64 {
-	b, err := ioutil.ReadFile(fmt.Sprintf("/sys/kernel/debug/block/%s/dropped", deviceBaseName))
+	b, err := os.ReadFile(fmt.Sprintf("/sys/kernel/debug/block/%s/dropped", deviceBaseName))
 	if err != nil {
 		log.Printf("Cannot read device drops %v", err)
 		return 0
@@ -59,27 +80,23 @@ var (
 	BlkTraceBufCount = flag.Int("blktrace.bufcount", 16, "The amount of buffers for blktrace to keep spare")
 )
 
-func setupBlkTrace(err error, f *os.File, eventConsumer chan unix.BLK_io_trace, deviceBaseName string) {
-	traceOpts := unix.BLK_user_trace_setup{
+func setupBlkTrace(f *os.File, eventConsumer chan BLK_io_trace, deviceBaseName string) {
+	traceOpts := BLK_user_trace_setup{
 		Act_mask: 2,
 		Buf_size: uint32(*BlkTraceBufSize),
 		Buf_nr:   uint32(*BlkTraceBufCount),
 	}
 
-	_, _, err = unix.Syscall(unix.SYS_IOCTL, f.Fd(), unix.BLKTRACESETUP, uintptr(unsafe.Pointer(&traceOpts)))
-	if err != nil {
-		if err.Error() != "errno 0" {
-			shutdownBlkTrace(f)
-			log.Fatalf("failed to BLKTRACESETUP -> %s", err)
-		}
+	_, _, errno := unix.Syscall(unix.SYS_IOCTL, f.Fd(), BLKTRACESETUP, uintptr(unsafe.Pointer(&traceOpts)))
+	if errno != 0 {
+		shutdownBlkTrace(f)
+		log.Fatalf("failed to BLKTRACESETUP -> %v", errno)
 	}
 
-	_, _, err = unix.Syscall(unix.SYS_IOCTL, f.Fd(), unix.BLKTRACESTART, 0)
-	if err != nil {
-		if err.Error() != "errno 0" {
-			unix.Syscall(unix.SYS_IOCTL, f.Fd(), unix.BLKTRACETEARDOWN, 0)
-			log.Fatalf("failed to BLKTRACESTART -> %s", err)
-		}
+	_, _, errno = unix.Syscall(unix.SYS_IOCTL, f.Fd(), BLKTRACESTART, 0)
+	if errno != 0 {
+		unix.Syscall(unix.SYS_IOCTL, f.Fd(), BLKTRACETEARDOWN, 0)
+		log.Fatalf("failed to BLKTRACESTART -> %v", errno)
 	}
 	tracedFile = f
 
@@ -92,9 +109,32 @@ func setupBlkTrace(err error, f *os.File, eventConsumer chan unix.BLK_io_trace, 
 		os.Exit(1)
 	}()
 
-	for i := 0; i < runtime.NumCPU(); i++ {
+	// One reader per relay file actually present, rather than one per
+	// runtime.NumCPU(): under a CPU affinity mask or cgroup cpuset, NumCPU
+	// can be smaller than the number of online CPUs, and any unread relay
+	// file would silently fill up and drop events.
+	traceDir := fmt.Sprintf("/sys/kernel/debug/block/%s", deviceBaseName)
+	entries, err := os.ReadDir(traceDir)
+	if err != nil {
+		shutdownBlkTrace(f)
+		log.Fatalf("cannot list %s (is debugfs mounted?) -- %v", traceDir, err)
+	}
+	traceFiles := 0
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "trace") {
+			continue
+		}
+		if _, err := strconv.Atoi(name[len("trace"):]); err != nil {
+			continue
+		}
+		traceFiles++
 		traceReaders.Add(1)
-		go readBlkTraceEventFiles(i, eventConsumer, deviceBaseName)
+		go readBlkTraceEventFiles(traceDir+"/"+name, eventConsumer)
+	}
+	if traceFiles == 0 {
+		shutdownBlkTrace(f)
+		log.Fatalf("no per-CPU trace files found in %s", traceDir)
 	}
 }
 
@@ -108,26 +148,30 @@ var (
 // BLKTRACETEARDOWN must not happen until this returns, or buffered events
 // are lost.
 func stopAndDrainBlkTrace(f *os.File) {
-	unix.Syscall(unix.SYS_IOCTL, f.Fd(), unix.BLKTRACESTOP, 0)
+	unix.Syscall(unix.SYS_IOCTL, f.Fd(), BLKTRACESTOP, 0)
 	atomic.StoreInt32(&traceStopping, 1)
 	traceReaders.Wait()
 }
 
 func shutdownBlkTrace(f *os.File) {
-	unix.Syscall(unix.SYS_IOCTL, f.Fd(), unix.BLKTRACESTOP, 0)
-	unix.Syscall(unix.SYS_IOCTL, f.Fd(), unix.BLKTRACETEARDOWN, 0)
+	unix.Syscall(unix.SYS_IOCTL, f.Fd(), BLKTRACESTOP, 0)
+	unix.Syscall(unix.SYS_IOCTL, f.Fd(), BLKTRACETEARDOWN, 0)
 }
 
-func readBlkTraceEventFiles(cpu int, out chan unix.BLK_io_trace, deviceBaseName string) {
+func readBlkTraceEventFiles(path string, out chan BLK_io_trace) {
 	defer traceReaders.Done()
-	f, err := os.Open(fmt.Sprintf("/sys/kernel/debug/block/%s/trace%d", deviceBaseName, cpu))
+	f, err := os.Open(path)
 	if err != nil {
-		fatalf("Cant open trace debugfs file?! %v", err)
+		fatalf("Cant open trace debugfs file %s ?! %v", path, err)
 	}
 	defer f.Close()
 
+	// Payload scratch space, reused across events. Len is a uint16 so 64KiB
+	// always fits the largest possible payload.
+	payload := make([]byte, 1<<16)
+
 	for {
-		BlkEvent := unix.BLK_io_trace{}
+		BlkEvent := BLK_io_trace{}
 		err := binary.Read(f, binary.LittleEndian, &BlkEvent)
 
 		if err != nil {
@@ -139,37 +183,37 @@ func readBlkTraceEventFiles(cpu int, out chan unix.BLK_io_trace, deviceBaseName 
 				continue
 			}
 			if atomic.LoadInt32(&traceStopping) != 0 {
-				log.Printf("trace reader %d error while draining: %v", cpu, err)
+				log.Printf("trace reader %s error while draining: %v", path, err)
 				return
 			}
 			// A dead reader means untracked writes, which means a corrupt image.
-			fatalf("trace reader %d failed (%v), cannot safely image device", cpu, err)
+			fatalf("trace reader %s failed (%v), cannot safely image device", path, err)
 		}
 
 		if BlkEvent.Magic&0xffffff00 != 0x65617400 {
-			fatalf("trace reader %d desynchronised (bad magic %x), cannot safely image device", cpu, BlkEvent.Magic)
+			fatalf("trace reader %s desynchronised (bad magic %x), cannot safely image device", path, BlkEvent.Magic)
 		}
 
 		// The payload must be consumed in full, or the next struct read
 		// decodes from the middle of this event's payload.
-		data := make([]byte, BlkEvent.Len)
+		data := payload[:BlkEvent.Len]
 		for got := 0; got < len(data); {
 			n, err := f.Read(data[got:])
 			got += n
 			if err != nil {
 				if err == io.EOF {
 					if atomic.LoadInt32(&traceStopping) != 0 {
-						log.Printf("trace reader %d stopped mid-event", cpu)
+						log.Printf("trace reader %s stopped mid-event", path)
 						return
 					}
 					time.Sleep(time.Millisecond * 10)
 					continue
 				}
 				if atomic.LoadInt32(&traceStopping) != 0 {
-					log.Printf("trace reader %d error while draining: %v", cpu, err)
+					log.Printf("trace reader %s error while draining: %v", path, err)
 					return
 				}
-				fatalf("trace reader %d failed (%v), cannot safely image device", cpu, err)
+				fatalf("trace reader %s failed (%v), cannot safely image device", path, err)
 			}
 		}
 		if BlkEvent.Error != 0 {
@@ -220,43 +264,6 @@ const (
 	BLK_TA_ABORT        = 1 << 31 /* request aborted */
 	BLK_TA_DRV_DATA     = 1 << 32 /* driver-specific binary data */
 )
-
-var flagLetters = map[uint64]string{
-	1 << 0:  "BLK_TC_READ",     /* reads */
-	1 << 1:  "BLK_TC_WRITE",    /* writes */
-	1 << 2:  "BLK_TC_BARRIER",  /* barrier */
-	1 << 3:  "BLK_TC_SYNC",     /* sync IO */
-	1 << 4:  "BLK_TC_QUEUE",    /* queueing/merging */
-	1 << 5:  "BLK_TC_REQUEUE",  /* requeueing */
-	1 << 6:  "BLK_TC_ISSUE",    /* issue */
-	1 << 7:  "BLK_TC_COMPLETE", /* completions */
-	1 << 8:  "BLK_TC_FS",       /* fs requests */
-	1 << 9:  "BLK_TC_PC",       /* pc requests */
-	1 << 10: "BLK_TC_NOTIFY",   /* special message */
-	1 << 11: "BLK_TC_AHEAD",    /* readahead */
-	1 << 12: "BLK_TC_META",     /* metadata */
-	1 << 13: "BLK_TC_DISCARD",  /* discard requests */
-	1 << 14: "BLK_TC_DRV_DATA", /* binary per-driver data */
-	1 << 15: "BLK_TC_END",      /* only 16-bits, reminder */
-
-	1 << 16: "BLK_TA_QUEUE",        /* queued */
-	1 << 17: "BLK_TA_BACKMERGE",    /* back merged to existing rq */
-	1 << 18: "BLK_TA_FRONTMERGE",   /* front merge to existing rq */
-	1 << 19: "BLK_TA_GETRQ",        /* allocated new request */
-	1 << 20: "BLK_TA_SLEEPRQ",      /* sleeping on rq allocation */
-	1 << 21: "BLK_TA_REQUEUE",      /* request requeued */
-	1 << 22: "BLK_TA_ISSUE",        /* sent to driver */
-	1 << 23: "BLK_TA_COMPLETE",     /* completed by driver */
-	1 << 24: "BLK_TA_PLUG",         /* queue was plugged */
-	1 << 25: "BLK_TA_UNPLUG_IO",    /* queue was unplugged by io */
-	1 << 26: "BLK_TA_UNPLUG_TIMER", /* queue was unplugged by timer */
-	1 << 27: "BLK_TA_INSERT",       /* insert request */
-	1 << 28: "BLK_TA_SPLIT",        /* bio was split */
-	1 << 29: "BLK_TA_BOUNCE",       /* bio was bounced */
-	1 << 30: "BLK_TA_REMAP",        /* bio was remapped */
-	1 << 31: "BLK_TA_ABORT",        /* request aborted */
-	// 1 << 32: "BLK_TA_DRV_DATA",     /* driver-specific binary data */
-}
 
 func unpackBits(in uint32) string {
 	in2 := uint64(in)

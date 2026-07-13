@@ -6,13 +6,13 @@ import (
 	"sync/atomic"
 )
 
-// This will need 270MB~ per TB of disk being tracked
+// This will need 256MB~ per TB of disk being tracked
 type DirtySectorTracker struct {
-	TotalSizeOfDevice uint64
-	Sectors           uint64
-	dirtyTracker      []uint64
-	// DirtySectors: CountDirty() must be called for this number to be updated
-	DirtySectors     int
+	dirtyTracker []uint64
+	// dirtyCount tracks how many bits are set, maintained by SetDirty so
+	// reading the count doesn't need a scan of the whole bitmap (which is
+	// gigabytes of memory traffic per poll on multi-TB devices).
+	dirtyCount       int64
 	warnedOutOfRange bool
 }
 
@@ -38,21 +38,28 @@ func (d *DirtySectorTracker) SetDirty(sector uint64) {
 			return
 		}
 		if atomic.CompareAndSwapUint64(&d.dirtyTracker[arrayTarget], old, old|mask) {
+			atomic.AddInt64(&d.dirtyCount, 1)
 			return
 		}
 	}
 }
 
-func (d *DirtySectorTracker) CountDirty() {
-	dirty := 0
+// Count returns how many sectors are currently marked dirty.
+func (d *DirtySectorTracker) Count() int64 {
+	return atomic.LoadInt64(&d.dirtyCount)
+}
+
+// countByScan recounts from the bitmap itself; kept for tests to validate
+// the incremental counter against.
+func (d *DirtySectorTracker) countByScan() int64 {
+	dirty := int64(0)
 	for i := 0; i < len(d.dirtyTracker); i++ {
 		v := atomic.LoadUint64(&d.dirtyTracker[i])
 		if v != 0 {
-			dirty += bits.OnesCount64(v)
+			dirty += int64(bits.OnesCount64(v))
 		}
 	}
-
-	d.DirtySectors = dirty
+	return dirty
 }
 
 // GetDirtySectors Gives a full list of sectors (in order) that have been marked as dirty
