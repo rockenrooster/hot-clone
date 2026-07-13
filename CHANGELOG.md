@@ -2,11 +2,36 @@
 
 All notable changes to hot-clone are documented here.
 
+## Unreleased
+
+### Added
+
+- Images now end with a trailer recording a CRC-32C checksum and byte count of the whole stream. `reassemble` verifies it and refuses to restore an image that is truncated, corrupted, or has trailing garbage. Images made by v1.0.1 or older have no trailer and can be restored with `-reassemble-allow-legacy` (without integrity verification).
+- Restoring to a regular file now writes sparse output: all-zero regions are skipped and left as holes, so a mostly-empty disk restores to a much smaller file. Block-device targets are still written in full.
+- Restoring to a block device now fails up front if the device is smaller than the image, instead of partway through the write.
+- Partitions are now refused by default (blktrace reports absolute disk sectors, so partition imaging is unverified and can silently record stale data); pass `-allow-partition` to override.
+- Device paths are resolved to their canonical kernel name, so `/dev/mapper/*` (LVM) and `/dev/disk/by-id/*` targets now work instead of failing to find their debugfs trace files.
+- The page cache is dropped behind the main read pass (`posix_fadvise(DONTNEED)`) so imaging a large device no longer evicts the live system's hot data; pass `-keep-cache` to restore the old behaviour.
+- Imaging can now run under a CPU affinity mask or cgroup cpuset safely: the trace readers are created per relay file actually present, not per `runtime.NumCPU()`, which previously left some CPUs' trace buffers undrained and guaranteed dropped events.
+- The progress line now reports throughput and an ETA.
+
+### Changed
+
+- The restore path is now OS-independent, so `-reassemble` works on Windows and macOS as well as Linux (only imaging still requires Linux).
+- The dirty-sector count shown each second is now maintained incrementally instead of scanning the entire bitmap, avoiding gigabytes of memory traffic per poll on multi-terabyte devices.
+- The blktrace event channel buffer was enlarged and trace readers now reuse a payload buffer, reducing the chance of dropped events under write bursts.
+
+### Removed
+
+- Dropped the vendored 500-file fork of `golang.org/x/sys` in favour of the upstream module; the two kernel structs hot-clone needs are now defined directly. This also removes a class of line-ending corruption that came from that vendored tree.
+
+### Fixed
+
+- `reassemble` no longer logs spurious "short read" warnings, and reports the restored size on completion.
+
 ## [1.0.1] - 2026-07-12
 
 - Renamed executable.
-
-## Unreleased
 
 ## [1.0.0] - 2026-07-12
 

@@ -1,5 +1,8 @@
 # Force LF line endings regardless of local core.autocrlf settings.
 # This repo is touched by more than one git installation on Windows with
 # different autocrlf defaults; without this, line endings drift depending
-# on which one last wrote a file (see e.g. the vendored sys/ shell scripts).
+# on which one last wrote a file.
 * text=auto eol=lf
+
+# Shell scripts must stay LF even if that rule is ever relaxed.
+*.sh text eol=lf

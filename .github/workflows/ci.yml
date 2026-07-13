@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: gofmt
+        if: runner.os == 'Linux'
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:" $unformatted
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      # The race detector covers the platform-independent concurrent code
+      # (DirtySectorTracker) on Linux, where it needs no external toolchain.
+      # Windows just builds and runs the tests to confirm the non-Linux
+      # build and the reassemble path work there.
+      - name: go test (race)
+        if: runner.os == 'Linux'
+        run: go test -race -count=1 ./...
+
+      - name: go test
+        if: runner.os == 'Windows'
+        run: go test -count=1 ./...
+
+      # Confirm the shipped artifact (linux/amd64) always cross-compiles.
+      - name: cross-build linux/amd64
+        if: runner.os == 'Linux'
+        run: GOOS=linux GOARCH=amd64 go build -o /dev/null .
