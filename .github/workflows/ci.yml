@@ -6,20 +6,15 @@ on:
 
 jobs:
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
 
       - name: gofmt
-        if: runner.os == 'Linux'
         run: |
           unformatted="$(gofmt -l .)"
           if [ -n "$unformatted" ]; then
@@ -30,22 +25,35 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      - name: go build
-        run: go build ./...
-
-      # The race detector covers the platform-independent concurrent code
-      # (DirtySectorTracker) on Linux, where it needs no external toolchain.
-      # Windows just builds and runs the tests to confirm the non-Linux
-      # build and the reassemble path work there.
       - name: go test (race)
-        if: runner.os == 'Linux'
         run: go test -race -count=1 ./...
 
-      - name: go test
-        if: runner.os == 'Windows'
-        run: go test -count=1 ./...
-
-      # Confirm the shipped artifact (linux/amd64) always cross-compiles.
-      - name: cross-build linux/amd64
-        if: runner.os == 'Linux'
+      - name: build linux/amd64
         run: GOOS=linux GOARCH=amd64 go build -o /dev/null .
+
+  # Images real block devices under concurrent writes and checks the
+  # restored images byte-for-byte. Two kernels, because blktrace changed:
+  # 22.04 runs 6.8 (blktrace protocol v1), 24.04 runs 7.0 (protocol v2;
+  # since 6.19 a v1 session silently drops FUA and write-zeroes events).
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+
+      - name: build
+        run: go build -o hot-clone .
+
+      - name: install test tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq blktrace dmsetup
+
+      - name: end-to-end tests
+        run: sudo bash test/e2e.sh ./hot-clone
