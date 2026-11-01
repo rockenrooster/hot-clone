@@ -101,6 +101,18 @@ func TestReassembleRoundTrip(t *testing.T) {
 	}
 }
 
+// A catch-up section that turns already-restored data into zeros (a sector
+// zeroed or trimmed during imaging) must overwrite it, not be left as a
+// hole that keeps the old bytes.
+func TestReassembleZeroCatchupOverwritesData(t *testing.T) {
+	main := bytes.Repeat([]byte{0xAB}, 8192)
+	sections := []testSection{{0, main}, {0, make([]byte, 4096)}, {12, make([]byte, 512)}}
+	got := runReassemble(t, buildTestImage(t, sections, true), false)
+	if !bytes.Equal(got, expectedContent(sections)) {
+		t.Fatalf("zero catch-up sections were not applied: restored byte[0]=%#x, byte[6144]=%#x", got[0], got[6144])
+	}
+}
+
 func TestReassembleLegacyImageAllowed(t *testing.T) {
 	sections := testSections()
 	got := runReassemble(t, buildTestImage(t, sections, false), true)

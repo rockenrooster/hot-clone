@@ -18,12 +18,15 @@ import (
 var DST DirtySectorTracker
 
 var (
-	dumpWrites     = flag.Bool("print-writes", false, "print all writes happening")
-	keepCache      = flag.Bool("keep-cache", false, "keep the device's pages in the page cache while reading (default is to drop them behind the read to limit impact on the live system)")
+	dumpWrites     = flag.Bool("print-writes", false, "print all trace events (writes) as they arrive")
 	allowPartition = flag.Bool("allow-partition", false, "allow imaging a partition device (UNSAFE: blktrace reports absolute disk sectors and partition handling is unverified, concurrent writes may be tracked at the wrong offsets)")
 )
 
 var bytesRead int64
+
+// catchingUp is set once the main pass is done, so the status reporter
+// stops printing read progress.
+var catchingUp int32
 
 // tracedFile is set once blktrace is enabled on the device. log.Fatalf exits
 // without running defers, so fatal paths must tear the trace down themselves.
@@ -36,25 +39,63 @@ func fatalf(format string, v ...interface{}) {
 	log.Fatalf(format, v...)
 }
 
+const (
+	// mainReadSize is how much the main pass reads per O_DIRECT request.
+	mainReadSize = 4 << 20
+
+	// Catch-up rounds run with the trace still on, so that writes landing
+	// meanwhile are caught by the next round, until a round has at most
+	// convergedSectors to re-read, stops shrinking, or maxCatchUpRounds
+	// have run. Only the last, small round runs with tracing stopped.
+	convergedSectors = 2048
+	maxCatchUpRounds = 8
+)
+
 func imageMain() {
-	deviceBaseName, isPartition := resolveDeviceName(*dev)
-	if isPartition && !*allowPartition {
+	if *dev == "" {
+		log.Fatalf("-device is required (or -reassemble to restore an image)")
+	}
+	d := resolveDevice(*dev)
+	if *resetTrace {
+		resetTraceMain(d)
+		return
+	}
+	if d.isPartition && !*allowPartition {
 		log.Fatalf("%v is a partition. blktrace reports absolute disk sectors and hot-clone's partition handling is unverified, so writes landing during the copy could be tracked at the wrong offsets and leave silently stale data in the image. Image the whole disk instead, or pass -allow-partition to accept the risk.", *dev)
 	}
-
-	eventConsumer := make(chan BLK_io_trace, 65536)
+	lockDevice(d)
 
 	f, err := os.Open(*dev)
 	if err != nil {
 		log.Fatalf("cannot open device %v - %v", *dev, err)
 	}
 
-	diskSectorsCount := getTotalDeviceSectorsSize(deviceBaseName)
-	setupBlkTrace(f, eventConsumer, deviceBaseName)
-	defer shutdownBlkTrace(f)
+	// All image data is read with O_DIRECT, straight from the device. The
+	// whole-disk page cache is not kept coherent with writes made through
+	// partitions, filesystems or stacked devices, so a cached page can be
+	// stale; reading one would put old data in the image even for sectors
+	// the trace marked dirty. It also keeps a whole-device read from
+	// flushing the live system's cache.
+	BlockF, err := os.OpenFile(*dev, os.O_RDONLY|unix.O_DIRECT, 0)
+	if err != nil {
+		log.Fatalf("cannot open block device %v - %v", *dev, err)
+	}
+	lbs, err := unix.IoctlGetInt(int(BlockF.Fd()), unix.BLKSSZGET)
+	if err != nil {
+		log.Fatalf("cannot get logical block size of %v - %v", *dev, err)
+	}
+	align := lbs
+	if align < 4096 {
+		align = 4096
+	}
+	lbsSectors := uint64(lbs) / 512
 
+	diskSectorsCount := getTotalDeviceSectorsSize(d.name)
 	DST = DirtySectorTracker{}
 	DST.Setup(diskSectorsCount)
+
+	setupBlkTrace(f, d)
+	defer shutdownBlkTrace(f)
 
 	// Periodic progress/safety reporter. It must be stopped before blktrace
 	// teardown removes the dropped-events file it polls.
@@ -72,6 +113,10 @@ func imageMain() {
 				return
 			case <-ticker.C:
 			}
+			checkBlkTraceDrops(d.name)
+			if atomic.LoadInt32(&catchingUp) != 0 {
+				continue
+			}
 			TotalRead := atomic.LoadInt64(&bytesRead)
 			rate := TotalRead - lastBytes
 			lastBytes = TotalRead
@@ -79,23 +124,10 @@ func imageMain() {
 			if rate > 0 && TotalRead <= totalBytes {
 				eta = (time.Duration((totalBytes-TotalRead)/rate) * time.Second).String()
 			}
-			eventDrops := getBlkTraceDrops(deviceBaseName)
-			log.Printf("Read %s of %s (%s/s, ETA %s) -- %v dirty sectors (%d event drops)",
-				ByteCountIEC(TotalRead), ByteCountIEC(totalBytes), ByteCountIEC(rate), eta, DST.Count(), eventDrops)
-			if eventDrops != 0 {
-				fatalf("Event drops detected (%d), cannot safely image device anymore", eventDrops)
-			}
+			log.Printf("Read %s of %s (%s/s, ETA %s) -- %v dirty sectors",
+				ByteCountIEC(TotalRead), ByteCountIEC(totalBytes), ByteCountIEC(rate), eta, DST.Count())
 		}
 	}()
-
-	trackerDone := make(chan struct{})
-	go trackEvents(eventConsumer, trackerDone)
-
-	// Begin reading the block device
-	BlockF, err := os.Open(*dev)
-	if err != nil {
-		fatalf("cannot open block device %v - %v", *dev, err)
-	}
 
 	// Everything written through cw is covered by the CRC/byte count that
 	// the end trailer records.
@@ -108,9 +140,9 @@ func imageMain() {
 	}
 	TotalRead := int64(0) // for use below only!!!
 	BytesLeftToRead := int64(diskSectorsCount * 512)
-	buf := make([]byte, 1024*1024)
+	buf := alignedBuffer(mainReadSize, align)
 	for BytesLeftToRead > 0 {
-		expectedRead := int64(1024 * 1024)
+		expectedRead := int64(mainReadSize)
 		if BytesLeftToRead < expectedRead {
 			expectedRead = BytesLeftToRead
 		}
@@ -120,7 +152,6 @@ func imageMain() {
 		if err != nil {
 			fatalf("Disk read failure -- %v (read %d of %d bytes, had %d bytes left)", err, n, expectedRead, BytesLeftToRead)
 		}
-		readStart := TotalRead
 		TotalRead += int64(n)
 		atomic.StoreInt64(&bytesRead, TotalRead)
 		BytesLeftToRead -= int64(n)
@@ -128,11 +159,6 @@ func imageMain() {
 		_, err = cw.Write(chunk)
 		if err != nil {
 			fatalf("Output file/device write failure -- %v", err)
-		}
-		if !*keepCache {
-			// Advisory only: drop the pages this pass just pulled in so a
-			// whole-device read doesn't evict the live system's page cache.
-			unix.Fadvise(int(BlockF.Fd()), readStart, int64(n), unix.FADV_DONTNEED)
 		}
 	}
 
@@ -176,51 +202,44 @@ func imageMain() {
 		log.Printf("Device overread by %d sectors", tmpSectors-diskSectorsCount)
 	}
 
-	// Stop tracing, then wait for every event still sitting in the kernel relay
-	// buffers and the channel to be applied to the bitmap. Snapshotting the
-	// dirty set with events still in flight would lose writes.
+	// Catch up. Each round re-reads what was written since the previous
+	// one; tracing stays on, so writes landing during a round are marked
+	// for the next. A write is marked again when it completes, so a round
+	// that read a sector before an in-flight write to it landed re-reads
+	// it next time.
+	atomic.StoreInt32(&catchingUp, 1)
+	out := bufio.NewWriterSize(cw, 1024*1024)
+	runBuf := alignedBuffer(int(maxRunSectors+2*lbsSectors)*512, align)
+	catchUp := func(round string) int64 {
+		taken, err := copyDirty(BlockF, out, &DST, lbsSectors, diskSectorsCount, runBuf)
+		if err != nil {
+			fatalf("%v", err)
+		}
+		log.Printf("Catch-up %s: re-read %d dirty sectors (%s)", round, taken, ByteCountIEC(taken*512))
+		return taken
+	}
+	prev := int64(-1)
+	for round := 1; round <= maxCatchUpRounds; round++ {
+		taken := catchUp(fmt.Sprintf("round %d", round))
+		if taken <= convergedSectors || (prev >= 0 && taken*4 > prev*3) {
+			break
+		}
+		prev = taken
+	}
+
+	// Stop tracing, then wait for every event still sitting in the kernel
+	// relay buffers to be applied to the bitmap. Taking the final dirty set
+	// with events still in flight would lose writes.
 	stopAndDrainBlkTrace(f)
-	close(eventConsumer)
-	<-trackerDone
 
 	// Final drop check: the counter file disappears at teardown, and the
 	// periodic check may not run again before we finish.
-	if drops := getBlkTraceDrops(deviceBaseName); drops != 0 {
-		fatalf("Event drops detected (%d), cannot safely image device", drops)
-	}
+	checkBlkTraceDrops(d.name)
 	close(statusDone)
 	<-statusStopped
 	shutdownBlkTrace(f)
 
-	// now let's catch up
-	totalDirty := DST.Count()
-	progressStep := totalDirty / 10
-	if progressStep < 1 {
-		progressStep = 1
-	}
-	out := bufio.NewWriterSize(cw, 1024*1024)
-	sectorBuf := make([]byte, 512)
-	dirtySectorChannel := DST.GetDirtySectors()
-	n := int64(0)
-	for sector := range dirtySectorChannel {
-		_, err := BlockF.Seek(int64(sector)*512, 0)
-		if err != nil {
-			fatalf("Seek failure (to sector %d) for catchup -- %v", sector, err)
-		}
-		_, err = io.ReadFull(BlockF, sectorBuf)
-		if err != nil {
-			fatalf("Read for catchup failed (sector %d) -- %v", sector, err)
-		}
-		fmt.Fprintf(out, "S:%d\tL:%d\n", sector, 512)
-		_, err = out.Write(sectorBuf)
-		if err != nil {
-			fatalf("Output file/device write failure -- %v", err)
-		}
-		n++
-		if n%progressStep == 0 {
-			log.Printf("Catching up %d/%d sectors", n, totalDirty)
-		}
-	}
+	catchUp("final round, tracing stopped")
 	err = out.Flush()
 	if err != nil {
 		fatalf("Output file/device write failure -- %v", err)
@@ -232,30 +251,4 @@ func imageMain() {
 		fatalf("Output file/device write failure -- %v", err)
 	}
 	log.Printf("Done")
-}
-
-func trackEvents(eventConsumer chan BLK_io_trace, done chan struct{}) {
-	defer close(done)
-	for event := range eventConsumer {
-		if event.Action&(1<<BLK_TC_WRITE) > 0 {
-			if *dumpWrites {
-				log.Printf("Write: Sector %#v (%d) (%d bytes) | F: %x (%s)", event.Sector, event.Sector, event.Bytes, event.Action, unpackBits(event.Action))
-			}
-			if event.Sector == 0 && event.Bytes == 0 {
-				continue
-			}
-			// Every write is marked dirty regardless of how far the sequential
-			// read has progressed: a queued write can complete after the read
-			// passes it, so whether the read observed it cannot be known.
-			DST.SetDirty(event.Sector)
-			otherSectors := uint64(event.Bytes) / 512
-			for i := uint64(1); i < otherSectors; i++ {
-				DST.SetDirty(event.Sector + i)
-			}
-		} else {
-			if *dumpWrites {
-				log.Printf("????: Sector %#v (%d) (%d bytes) | F: %x (%s)", event.Sector, event.Sector, event.Bytes, event.Action, unpackBits(event.Action))
-			}
-		}
-	}
 }

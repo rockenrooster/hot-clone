@@ -2,9 +2,7 @@
 
 Create a block-level image of a **live Linux block device**, including the disk containing the running root filesystem.
 
-`hot-clone` reads the device while using Linux `blktrace` to track sectors changed during the copy. After the main pass finishes, it rereads those sectors and appends the corrected data to the backup. Each image ends with a checksum trailer so a truncated or corrupted backup is detected on restore rather than silently trusted.
-
-Creating an image requires Linux. Restoring one (`-reassemble`) works on any OS, including Windows and macOS.
+`hot-clone` reads the device while using Linux `blktrace` to track sectors changed during the copy. After the main pass finishes, it rereads those sectors and appends the corrected data to the backup — in rounds while tracing is still running, so writes that land during the catch-up are caught too. Each image ends with a checksum trailer so a truncated or corrupted backup is detected on restore rather than silently trusted.
 
 > [!WARNING]
 > Imaging a mounted filesystem is not the same as creating an atomic snapshot. Prefer LVM, ZFS, Btrfs, DRBD, filesystem snapshots, or an offline image when available.
@@ -19,12 +17,12 @@ Creating an image requires Linux. Restoring one (`-reassemble`) works on any OS,
 * Restores empty regions sparsely, and refuses a destination that is too small
 * Streams backup data through standard output
 * Supports files, SSH, pipes, and compression
-* Restores to a raw image file or block device (on any OS)
+* Restores to a raw image file or block device
 
 ## Requirements
 
-* Linux, root access, and a kernel/device that support `blktrace` — for **creating** an image
-* Any OS — for **restoring** an image
+* Linux, root access, and a kernel/device that support `blktrace`, with debugfs mounted at `/sys/kernel/debug`
+* Kernel lockdown must be off: it blocks the trace files hot-clone reads, and Debian and Ubuntu turn it on under Secure Boot (check `/sys/kernel/security/lockdown`)
 * Go 1.21 or newer when building from source
 * Roughly 256 MiB of RAM per TB of device being imaged (for the dirty-sector bitmap)
 
@@ -63,10 +61,14 @@ Progress is written to standard error, while the backup stream is written to sta
 Example:
 
 ```text
-Read 3.7 GiB -- 360 Dirty sectors (0 event drops)
-Catching up 360/360 sectors
+Tracing writes to sdb with blktrace protocol v2
+Read 3.7 GiB of 3.7 GiB (210.3 MiB/s, ETA 0s) -- 360 dirty sectors
+Catch-up round 1: re-read 360 dirty sectors (180.0 KiB)
+Catch-up final round, tracing stopped: re-read 4 dirty sectors (2.0 KiB)
 Done
 ```
+
+Linux 6.19 and newer get blktrace protocol v2; older kernels use v1.
 
 Do not save the backup onto the device being imaged.
 
@@ -129,9 +131,9 @@ Confirm the destination with `lsblk` before running the command.
 -allow-partition
       Permit imaging a partition (unsafe; see the note above)
 
--keep-cache
-      Keep read data in the page cache (default: drop it behind the read
-      to avoid evicting the live system's cache)
+-reset-trace
+      Remove a blktrace session left on -device (for example by a killed
+      run), then exit
 
 -reassemble string
       Backup file to restore ("-" reads from standard input)
@@ -150,7 +152,7 @@ Confirm the destination with `lsblk` before running the command.
       Size of each trace buffer
 
 -print-writes
-      Log observed writes
+      Log every trace event
 
 -verbose
       Enable additional logging
@@ -170,6 +172,16 @@ sudo ./hot-clone \
 
 If trace events are dropped, the backup is aborted because it can no longer be considered safe. Delete the incomplete output and retry with less disk activity or larger buffers.
 
+## Stale blktrace sessions
+
+hot-clone removes its blktrace session however it exits, short of `kill -9` or a crash. If a run reports that the device already has a blktrace session and nothing else is tracing it, remove the leftover session:
+
+```bash
+sudo ./hot-clone -device /dev/sdb -reset-trace
+```
+
+`-reset-trace` refuses to run while another hot-clone is working on the same device.
+
 ## Limitations
 
 `hot-clone` does not create a true point-in-time snapshot.
@@ -187,14 +199,17 @@ For better results:
 
 This fork adds, on top of the original:
 
+* blktrace protocol v2 on Linux 6.19+, where the old protocol silently drops FUA and write-zeroes writes
+* Write tracking that works on device-mapper (LVM, dm-crypt) and md devices
+* Direct (`O_DIRECT`) reads, so stale page-cache data never reaches the image
+* Catch-up rounds while tracing is still on, so writes during the catch-up are caught
 * Checksum trailer so truncated or corrupted backups are caught on restore
 * Sparse restore, and refusal of a too-small destination device
 * Partition-imaging guard and LVM / `by-id` device resolution
-* Cross-platform restore (Windows and macOS, not just Linux)
-* Page-cache friendliness while imaging (`posix_fadvise`)
 * Safety under CPU affinity masks / cgroup cpusets
-* Reliability fixes: lost/delayed write events, dropped-event detection, trace cleanup after errors or termination, dirty-sector tracking races, read/write error handling
+* Reliability fixes: lost/delayed write events, dropped-event detection, trace cleanup after errors, signals or a broken output pipe, leaving other tracers' sessions alone, dirty-sector tracking races, read/write error handling
 * Restore and catch-up performance
+* End-to-end tests in CI that image real block devices under concurrent writes
 * Removal of the vendored `golang.org/x/sys` fork in favour of upstream
 
 See [CHANGELOG.md](CHANGELOG.md) for details.

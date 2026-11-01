@@ -87,9 +87,9 @@ func reassembleMain() {
 		}
 	}
 
-	// Zero-filled chunks are skipped (left as holes) when restoring to a
-	// regular file: os.Create truncated it, so unwritten ranges read back
-	// as zeros anyway. Devices keep their old contents and must be
+	// Zero-filled chunks can be skipped (left as holes) when restoring to a
+	// regular file: os.Create truncated it, so ranges nothing has written
+	// read back as zeros anyway. Devices keep their old contents and must be
 	// overwritten in full.
 	sparseOK := !isDevice
 
@@ -140,6 +140,11 @@ func reassembleMain() {
 			log.Fatalf("Image needs %s but output device %v only holds %s -- refusing to restore",
 				ByteCountIEC(sectionEnd), *reassembleOutput, ByteCountIEC(deviceSize))
 		}
+		// Holes are only safe where no earlier section has written. A later
+		// section (a catch-up copy) that turns already-restored data into
+		// zeros -- a sector zeroed or trimmed during imaging -- must
+		// overwrite it, or the old data would survive.
+		skipZeros := sparseOK && SectorStart*512 >= maxEnd
 		if sectionEnd > maxEnd {
 			maxEnd = sectionEnd
 		}
@@ -170,7 +175,7 @@ func reassembleMain() {
 			streamBytes += expectedRead
 			BytesLeftToRead -= expectedRead
 
-			if sparseOK && bytes.Equal(chunk, zeroBuf[:expectedRead]) {
+			if skipZeros && bytes.Equal(chunk, zeroBuf[:expectedRead]) {
 				writePos += expectedRead
 				positioned = false
 				continue
