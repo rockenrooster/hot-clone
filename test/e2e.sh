@@ -91,9 +91,10 @@ writer() {
 		case $((i % 4)) in
 		0) dd if=/dev/urandom of="$t" bs=4k count=4 seek="$off" oflag=direct conv=notrunc status=none ;;
 		1) dd if=/dev/urandom of="$t" bs=4k count=1 seek="$off" oflag=direct,dsync conv=notrunc status=none ;;
-		2) blkdiscard -z -o $((off * 4096)) -l 16384 "$t" ;;
-		3) blkdiscard -o $((off * 4096)) -l 16384 "$t" 2>/dev/null ||
-			blkdiscard -z -o $((off * 4096)) -l 16384 "$t" ;;
+		# -f: the loop device may be held open exclusively by a dm device on top
+		2) blkdiscard -f -z -o $((off * 4096)) -l 16384 "$t" ;;
+		3) blkdiscard -f -o $((off * 4096)) -l 16384 "$t" 2>/dev/null ||
+			blkdiscard -f -z -o $((off * 4096)) -l 16384 "$t" ;;
 		esac
 		sleep 0.02
 	done
@@ -176,8 +177,8 @@ test_whole_disk() {
 	rc=$?
 	wait "$w"
 	if [ $rc -ne 0 ]; then fail "$s: hot-clone exited $rc" "$WORK/$s.log"; return; fi
-	if ! expect_protocol $s; then fail "$s: wrong or missing blktrace protocol for $(uname -r)" "$WORK/$s.log"; return; fi
 	if verify $s "$dev"; then pass $s; else fail "$s: image does not match device" "$WORK/$s.log"; fi
+	if ! expect_protocol $s; then fail "$s: log does not name the blktrace protocol $(uname -r) needs" "$WORK/$s.log"; fi
 }
 
 # A bio-based device (dm-linear, like an LVM volume) imaged directly.
